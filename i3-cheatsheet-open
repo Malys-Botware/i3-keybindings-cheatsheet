@@ -10,4 +10,4 @@ if ! pgrep -f "i3-cheatsheet-server" > /dev/null 2>&1; then
 fi
 
 # Open in default browser
-xdg-open "$URL" 2>/dev/null || firedragon "$URL" 2>/dev/null &
+xdg-open "$URL" 2>/dev/null || sensible-browser "$URL" 2>/dev/null || firefox "$URL" 2>/dev/null &

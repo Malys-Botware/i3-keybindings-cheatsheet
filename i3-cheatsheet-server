@@ -18,6 +18,8 @@ from pathlib import Path
 
 PORT = 9876
 I3_CONFIG = os.path.expanduser("~/.config/i3/config")
+if not os.path.exists(I3_CONFIG):
+    I3_CONFIG = os.path.expanduser("~/.i3/config")
 
 # ── i3 config parser ──────────────────────────────────────────────
 
