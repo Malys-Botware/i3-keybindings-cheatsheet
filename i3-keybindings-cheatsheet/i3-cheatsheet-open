@@ -1,0 +1,13 @@
+#!/bin/bash
+# i3-cheatsheet-open: Start cheatsheet server if not running, open in browser
+PORT=9876
+URL="http://127.0.0.1:$PORT"
+
+# Start server if not running
+if ! pgrep -f "i3-cheatsheet-server" > /dev/null 2>&1; then
+    nohup ~/.local/bin/i3-cheatsheet-server > /dev/null 2>&1 &
+    sleep 0.3  # give it a moment to start
+fi
+
+# Open in default browser
+xdg-open "$URL" 2>/dev/null || firedragon "$URL" 2>/dev/null &

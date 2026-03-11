@@ -1,0 +1,1111 @@
+#!/usr/bin/env python3
+"""
+i3 Keybinding Cheatsheet Server
+Parses i3 config, serves an interactive HTML cheatsheet with inline editing.
+Saves changes back to the i3 config and reloads i3.
+"""
+
+import http.server
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.parse
+from datetime import datetime
+from pathlib import Path
+
+PORT = 9876
+I3_CONFIG = os.path.expanduser("~/.config/i3/config")
+
+# ── i3 config parser ──────────────────────────────────────────────
+
+def parse_i3_config(config_path=I3_CONFIG):
+    """Parse i3 config and extract keybindings with context."""
+    bindings = []
+    variables = {}
+
+    try:
+        with open(config_path, "r") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return [], {}
+
+    current_mode = None
+    brace_depth = 0
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+
+        # Capture variables
+        m = re.match(r'^set\s+(\$\w+)\s+(.+)', stripped)
+        if m:
+            variables[m.group(1)] = m.group(2).strip()
+
+        # Track mode blocks
+        mode_match = re.match(r'^mode\s+"([^"]+)"\s*\{', stripped)
+        if mode_match:
+            current_mode = mode_match.group(1)
+            brace_depth = 1
+            continue
+
+        if current_mode:
+            brace_depth += stripped.count('{') - stripped.count('}')
+            if brace_depth <= 0:
+                current_mode = None
+                continue
+
+        # Capture bindsym lines
+        m = re.match(r'^bindsym\s+(.+?)\s+(exec\s+.*|kill|focus\s+\w+|move\s+.*|split\s+\w|fullscreen\s+.*|layout\s+.*|floating\s+.*|sticky\s+.*|border\s+.*|scratchpad\s+.*|workspace\s+.*|mode\s+.*|reload|restart|bar\s+.*|gaps\s+.*|resize\s+.*)', stripped)
+        if m:
+            keys_raw = m.group(1).strip()
+            action_raw = m.group(2).strip()
+
+            # Skip --whole-window mouse bindings
+            if '--whole-window' in keys_raw:
+                continue
+
+            # Skip Return/Escape exit bindings inside modes (just noise)
+            if current_mode and action_raw == 'mode "default"':
+                continue
+
+            # Get comment from same line or line above
+            comment = ""
+            inline_comment = re.search(r'#\s*(.+)$', line)
+            if inline_comment:
+                comment = inline_comment.group(1).strip()
+            elif i > 0:
+                prev = lines[i-1].strip()
+                if prev.startswith("###") or prev.startswith("# "):
+                    comment = prev.lstrip("#").strip().rstrip(":").strip()
+
+            # Add mode context to comment
+            if current_mode:
+                mode_label = resolve_vars(current_mode, variables)
+                # Strip Mod4/Mod1 artifacts from mode labels
+                mode_label = mode_label.replace("Super", "").replace("Alt", "").strip()
+                if not mode_label:
+                    mode_label = current_mode
+                mode_prefix = f"[{mode_label}] "
+                if comment:
+                    comment = mode_prefix + comment
+                else:
+                    comment = mode_prefix.strip()
+
+            bindings.append({
+                "line_num": i,
+                "keys_raw": keys_raw,
+                "action_raw": action_raw,
+                "comment": comment,
+                "full_line": stripped,
+            })
+
+    return bindings, variables
+
+
+def resolve_vars(text, variables):
+    """Replace variables, longest-first to avoid prefix collisions."""
+    result = text
+    for var, val in sorted(variables.items(), key=lambda x: -len(x[0])):
+        result = result.replace(var, val)
+    result = result.replace("Mod4", "Super").replace("Mod1", "Alt")
+    return result
+
+
+def categorize_binding(binding):
+    """Assign a category based on the action."""
+    action = binding["action_raw"].lower()
+    keys = binding["keys_raw"].lower()
+    comment = binding["comment"].lower()
+
+    if any(k in keys for k in ["xf86audio"]):
+        return "Media & Volume"
+    if any(k in keys for k in ["xf86monbrightness"]):
+        return "Brightness"
+    if "workspace" in action and "move" in action:
+        return "Move to Workspace"
+    if "workspace" in action:
+        return "Workspaces"
+    if "focus" in action and "mode_toggle" not in action:
+        return "Focus & Navigation"
+    if "move" in action:
+        return "Move Windows"
+    if "exec" in action:
+        if any(w in action for w in ["browser", "firefox", "firedragon", "chromium"]):
+            return "Applications"
+        if any(w in action for w in ["terminal", "kitty", "alacritty"]):
+            return "Applications"
+        if any(w in action for w in ["rofi", "dmenu"]):
+            return "Launcher"
+        if any(w in action for w in ["flameshot", "screenshot", "print"]):
+            return "Screenshot"
+        if any(w in action for w in ["lock", "i3lock"]):
+            return "System"
+        if any(w in action for w in ["pactl", "pulse", "volume"]):
+            return "Media & Volume"
+        if any(w in action for w in ["brightness"]):
+            return "Brightness"
+        if any(w in action for w in ["playerctl"]):
+            return "Media & Volume"
+        if any(w in action for w in ["shcts", "cheatsheet"]):
+            return "Applications"
+        return "Applications"
+    if "layout" in action or "split" in action:
+        return "Layout"
+    if "floating" in action or "sticky" in action:
+        return "Layout"
+    if "fullscreen" in action:
+        return "Layout"
+    if "kill" in action:
+        return "Window Management"
+    if "border" in action:
+        return "Window Management"
+    if "scratchpad" in action:
+        return "Scratchpad"
+    if "resize" in action:
+        return "Resize"
+    if "mode" in action:
+        return "Modes"
+    if "reload" in action or "restart" in action:
+        return "System"
+    if "bar" in action:
+        return "System"
+    if "gaps" in action:
+        return "Gaps"
+    return "Other"
+
+
+def describe_action(action_raw, variables):
+    """Create a human-readable description of the action."""
+    action = resolve_vars(action_raw, variables)
+
+    # Common patterns
+    if "exec --no-startup-id" in action:
+        action = action.replace("exec --no-startup-id ", "")
+    if action.startswith("exec "):
+        action = action.replace("exec ", "", 1)
+
+    # Clean up trailing ;focus
+    action = re.sub(r';focus$', '', action)
+
+    # Trim long paths
+    action = action.replace(os.path.expanduser("~"), "~")
+
+    return action.strip()
+
+
+def get_bindings_json():
+    """Return categorized bindings as JSON."""
+    bindings, variables = parse_i3_config()
+    categorized = {}
+    category_order = [
+        "Applications", "Launcher", "Screenshot",
+        "Focus & Navigation", "Move Windows", "Layout",
+        "Window Management", "Scratchpad",
+        "Workspaces", "Move to Workspace",
+        "Media & Volume", "Brightness",
+        "Resize", "Gaps", "Modes", "System", "Other"
+    ]
+
+    for b in bindings:
+        cat = categorize_binding(b)
+        if cat not in categorized:
+            categorized[cat] = []
+
+        human_keys = resolve_vars(b["keys_raw"], variables)
+        description = describe_action(b["action_raw"], variables)
+
+        categorized[cat].append({
+            "line_num": b["line_num"],
+            "keys_raw": b["keys_raw"],
+            "keys_display": human_keys,
+            "action_raw": b["action_raw"],
+            "action_display": description,
+            "comment": b["comment"],
+            "category": cat,
+        })
+
+    # Sort categories by defined order
+    sorted_cats = []
+    for cat in category_order:
+        if cat in categorized:
+            sorted_cats.append({"name": cat, "bindings": categorized[cat]})
+    for cat in categorized:
+        if cat not in category_order:
+            sorted_cats.append({"name": cat, "bindings": categorized[cat]})
+
+    return sorted_cats
+
+
+# ── Save handler ──────────────────────────────────────────────────
+
+def save_binding(line_num, new_keys_raw, new_action_raw):
+    """Modify a single bindsym line in the i3 config."""
+    try:
+        with open(I3_CONFIG, "r") as f:
+            lines = f.readlines()
+
+        # Backup
+        backup = I3_CONFIG + ".bak." + datetime.now().strftime("%Y%m%d_%H%M%S")
+        shutil.copy2(I3_CONFIG, backup)
+
+        old_line = lines[line_num]
+        # Preserve indentation and any trailing comment
+        indent = re.match(r'^(\s*)', old_line).group(1)
+        trailing_comment = ""
+        tc = re.search(r'\s+(#.+)$', old_line.rstrip('\n'))
+        if tc:
+            trailing_comment = "  " + tc.group(1)
+
+        new_line = f"{indent}bindsym {new_keys_raw} {new_action_raw}{trailing_comment}\n"
+        lines[line_num] = new_line
+
+        with open(I3_CONFIG, "w") as f:
+            f.writelines(lines)
+
+        # Reload i3
+        subprocess.run(["i3-msg", "reload"], capture_output=True)
+        return True, f"Saved. Backup at {backup}"
+    except Exception as e:
+        return False, str(e)
+
+
+# ── HTML template ─────────────────────────────────────────────────
+
+def get_html():
+    return r'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>⌨ i3 Keybindings</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg-deep: #0d0f1a;
+    --bg-base: #141627;
+    --bg-surface: #1a1d33;
+    --bg-elevated: #222544;
+    --bg-hover: #2a2d52;
+    --border: #2e3158;
+    --border-focus: #e06c75;
+    --text: #e2e4f0;
+    --text-dim: #8b8fad;
+    --text-muted: #5c5f7e;
+    --accent: #e06c75;
+    --accent-glow: rgba(224, 108, 117, 0.15);
+    --accent-secondary: #c678dd;
+    --accent-green: #98c379;
+    --accent-blue: #61afef;
+    --accent-yellow: #e5c07b;
+    --accent-cyan: #56b6c2;
+    --key-bg: #1e2140;
+    --key-border: #3a3e6a;
+    --key-shadow: #0a0c15;
+    --radius: 10px;
+    --radius-sm: 6px;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html {
+    font-size: 15px;
+    scrollbar-color: var(--border) var(--bg-deep);
+  }
+
+  body {
+    font-family: 'Outfit', sans-serif;
+    background: var(--bg-deep);
+    color: var(--text);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* ── Subtle background pattern ── */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background:
+      radial-gradient(ellipse 80% 60% at 20% 10%, rgba(224,108,117,0.04), transparent),
+      radial-gradient(ellipse 60% 50% at 80% 80%, rgba(198,120,221,0.03), transparent);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* ── Header ── */
+  .header {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    background: rgba(13, 15, 26, 0.85);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border-bottom: 1px solid var(--border);
+    padding: 1rem 2rem;
+  }
+
+  .header-inner {
+    max-width: 1400px;
+    margin: 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 1.5rem;
+    flex-wrap: wrap;
+  }
+
+  .header h1 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 1.2rem;
+    font-weight: 700;
+    color: var(--accent);
+    letter-spacing: -0.02em;
+    white-space: nowrap;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .header h1 span {
+    color: var(--text-dim);
+    font-weight: 400;
+    font-size: 0.85rem;
+  }
+
+  /* ── Search ── */
+  .search-box {
+    flex: 1;
+    min-width: 200px;
+    max-width: 450px;
+    position: relative;
+  }
+
+  .search-box input {
+    width: 100%;
+    padding: 0.6rem 1rem 0.6rem 2.5rem;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    font-family: 'Outfit', sans-serif;
+    font-size: 0.9rem;
+    outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+
+  .search-box input:focus {
+    border-color: var(--border-focus);
+    box-shadow: 0 0 0 3px var(--accent-glow);
+  }
+
+  .search-box input::placeholder { color: var(--text-muted); }
+
+  .search-box::before {
+    content: '⌕';
+    position: absolute;
+    left: 0.85rem;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 1.1rem;
+    color: var(--text-muted);
+    pointer-events: none;
+  }
+
+  .search-hint {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    margin-left: auto;
+    white-space: nowrap;
+  }
+
+  .search-hint kbd {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.65rem;
+    padding: 0.1rem 0.35rem;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    margin: 0 0.1rem;
+  }
+
+  /* ── Stats bar ── */
+  .stats-bar {
+    max-width: 1400px;
+    margin: 1rem auto 0;
+    padding: 0 2rem;
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  .stat-chip {
+    font-size: 0.72rem;
+    font-weight: 500;
+    padding: 0.3rem 0.65rem;
+    border-radius: 20px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: all 0.2s;
+    user-select: none;
+  }
+
+  .stat-chip:hover, .stat-chip.active {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: var(--accent-glow);
+  }
+
+  .stat-chip .count {
+    font-family: 'JetBrains Mono', monospace;
+    margin-left: 0.3rem;
+    opacity: 0.6;
+  }
+
+  /* ── Main content ── */
+  .content {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 1.5rem 2rem 4rem;
+    position: relative;
+    z-index: 1;
+  }
+
+  /* ── Category sections ── */
+  .category {
+    margin-bottom: 2rem;
+    animation: fadeUp 0.4s ease both;
+  }
+
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .category:nth-child(2) { animation-delay: 0.05s; }
+  .category:nth-child(3) { animation-delay: 0.1s; }
+  .category:nth-child(4) { animation-delay: 0.15s; }
+  .category:nth-child(5) { animation-delay: 0.2s; }
+
+  .category-header {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.75rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .category-icon {
+    font-size: 1rem;
+    width: 1.8rem;
+    height: 1.8rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-sm);
+    flex-shrink: 0;
+  }
+
+  .category-name {
+    font-size: 0.95rem;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+  }
+
+  .category-count {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    margin-left: auto;
+  }
+
+  /* ── Binding rows ── */
+  .binding-row {
+    display: grid;
+    grid-template-columns: minmax(180px, 280px) 1fr auto;
+    align-items: center;
+    gap: 1rem;
+    padding: 0.6rem 0.8rem;
+    border-radius: var(--radius-sm);
+    transition: background 0.15s;
+  }
+
+  .binding-row:hover {
+    background: var(--bg-surface);
+  }
+
+  .binding-row.editing {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-focus);
+    border-radius: var(--radius);
+    padding: 0.8rem;
+    margin: 0.3rem 0;
+  }
+
+  /* ── Key display ── */
+  .keys {
+    display: flex;
+    gap: 0.3rem;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  .key {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.78rem;
+    font-weight: 600;
+    padding: 0.25rem 0.55rem;
+    background: var(--key-bg);
+    border: 1px solid var(--key-border);
+    border-radius: 5px;
+    color: var(--text);
+    box-shadow: 0 2px 0 var(--key-shadow);
+    white-space: nowrap;
+    line-height: 1.4;
+  }
+
+  .key-sep {
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    margin: 0 0.05rem;
+  }
+
+  .key.mod { color: var(--accent); border-color: rgba(224,108,117,0.3); }
+  .key.special { color: var(--accent-cyan); border-color: rgba(86,182,194,0.3); }
+
+  /* ── Action text ── */
+  .action-text {
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    line-height: 1.4;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .action-text .cmd {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.78rem;
+    color: var(--accent-blue);
+    opacity: 0.7;
+  }
+
+  .action-text .comment-tag {
+    color: var(--accent-yellow);
+    font-weight: 500;
+  }
+
+  /* ── Edit button ── */
+  .edit-btn {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    padding: 0.3rem 0.6rem;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-muted);
+    cursor: pointer;
+    opacity: 0;
+    transition: all 0.2s;
+  }
+
+  .binding-row:hover .edit-btn { opacity: 1; }
+  .edit-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: var(--accent-glow);
+  }
+
+  /* ── Edit form ── */
+  .edit-form {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.6rem;
+    margin-top: 0.6rem;
+  }
+
+  .edit-form label {
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 0.2rem;
+    display: block;
+  }
+
+  .edit-form input {
+    width: 100%;
+    padding: 0.5rem 0.7rem;
+    background: var(--bg-base);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.82rem;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+
+  .edit-form input:focus {
+    border-color: var(--accent);
+  }
+
+  .edit-actions {
+    grid-column: 1 / -1;
+    display: flex;
+    gap: 0.5rem;
+    justify-content: flex-end;
+    margin-top: 0.3rem;
+  }
+
+  .btn {
+    font-family: 'Outfit', sans-serif;
+    font-size: 0.78rem;
+    font-weight: 500;
+    padding: 0.4rem 1rem;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .btn-cancel {
+    background: transparent;
+    color: var(--text-dim);
+  }
+  .btn-cancel:hover { background: var(--bg-surface); }
+
+  .btn-save {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
+  .btn-save:hover { filter: brightness(1.1); }
+
+  /* ── Toast notification ── */
+  .toast {
+    position: fixed;
+    bottom: 2rem;
+    left: 50%;
+    transform: translateX(-50%) translateY(100px);
+    background: var(--bg-elevated);
+    border: 1px solid var(--accent-green);
+    color: var(--accent-green);
+    padding: 0.7rem 1.5rem;
+    border-radius: var(--radius);
+    font-size: 0.85rem;
+    font-weight: 500;
+    z-index: 999;
+    opacity: 0;
+    transition: all 0.3s ease;
+    pointer-events: none;
+  }
+
+  .toast.show {
+    transform: translateX(-50%) translateY(0);
+    opacity: 1;
+  }
+
+  .toast.error {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* ── Hidden utility ── */
+  .hidden { display: none !important; }
+
+  /* ── No results ── */
+  .no-results {
+    text-align: center;
+    padding: 4rem 2rem;
+    color: var(--text-muted);
+    font-size: 0.95rem;
+  }
+
+  .no-results span { font-size: 2rem; display: block; margin-bottom: 0.8rem; }
+
+  /* ── Category icon colors ── */
+  .cat-applications .category-icon { background: rgba(224,108,117,0.15); color: #e06c75; }
+  .cat-launcher .category-icon { background: rgba(198,120,221,0.15); color: #c678dd; }
+  .cat-screenshot .category-icon { background: rgba(229,192,123,0.15); color: #e5c07b; }
+  .cat-focus .category-icon { background: rgba(97,175,239,0.15); color: #61afef; }
+  .cat-move-win .category-icon { background: rgba(86,182,194,0.15); color: #56b6c2; }
+  .cat-layout .category-icon { background: rgba(198,120,221,0.15); color: #c678dd; }
+  .cat-window .category-icon { background: rgba(224,108,117,0.15); color: #e06c75; }
+  .cat-scratchpad .category-icon { background: rgba(229,192,123,0.15); color: #e5c07b; }
+  .cat-workspaces .category-icon { background: rgba(152,195,121,0.15); color: #98c379; }
+  .cat-move-ws .category-icon { background: rgba(152,195,121,0.1); color: #78a85e; }
+  .cat-media .category-icon { background: rgba(224,108,117,0.15); color: #e06c75; }
+  .cat-brightness .category-icon { background: rgba(229,192,123,0.15); color: #e5c07b; }
+  .cat-resize .category-icon { background: rgba(86,182,194,0.15); color: #56b6c2; }
+  .cat-gaps .category-icon { background: rgba(97,175,239,0.15); color: #61afef; }
+  .cat-modes .category-icon { background: rgba(198,120,221,0.15); color: #c678dd; }
+  .cat-system .category-icon { background: rgba(224,108,117,0.15); color: #e06c75; }
+  .cat-other .category-icon { background: rgba(139,143,173,0.15); color: #8b8fad; }
+
+  /* ── Responsive ── */
+  @media (max-width: 900px) {
+    .binding-row {
+      grid-template-columns: 1fr;
+      gap: 0.3rem;
+    }
+    .edit-btn { opacity: 1; }
+    .header-inner { gap: 0.8rem; }
+    .content { padding: 1rem; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-inner">
+    <h1>⌨ i3 bindings <span>cheatsheet</span></h1>
+    <div class="search-box">
+      <input type="text" id="search" placeholder="Search keys or actions..." autofocus>
+    </div>
+    <div class="search-hint"><kbd>/</kbd> focus &nbsp; <kbd>Esc</kbd> clear</div>
+  </div>
+</div>
+
+<div class="stats-bar" id="statsBar"></div>
+
+<div class="content" id="content">
+  <div class="no-results hidden" id="noResults">
+    <span>¯\_(ツ)_/¯</span>
+    No bindings match your search.
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const CATEGORY_META = {
+  "Applications":       { icon: "◉", css: "cat-applications" },
+  "Launcher":           { icon: "▦", css: "cat-launcher" },
+  "Screenshot":         { icon: "◫", css: "cat-screenshot" },
+  "Focus & Navigation": { icon: "◇", css: "cat-focus" },
+  "Move Windows":       { icon: "⇱", css: "cat-move-win" },
+  "Layout":             { icon: "⊞", css: "cat-layout" },
+  "Window Management":  { icon: "▣", css: "cat-window" },
+  "Scratchpad":         { icon: "▤", css: "cat-scratchpad" },
+  "Workspaces":         { icon: "⊡", css: "cat-workspaces" },
+  "Move to Workspace":  { icon: "⇥", css: "cat-move-ws" },
+  "Media & Volume":     { icon: "♪", css: "cat-media" },
+  "Brightness":         { icon: "☀", css: "cat-brightness" },
+  "Resize":             { icon: "⤡", css: "cat-resize" },
+  "Gaps":               { icon: "⊟", css: "cat-gaps" },
+  "Modes":              { icon: "◈", css: "cat-modes" },
+  "System":             { icon: "⏻", css: "cat-system" },
+  "Other":              { icon: "·", css: "cat-other" },
+};
+
+const MODIFIER_KEYS = new Set([
+  "super", "alt", "shift", "ctrl", "control", "mod4", "mod1"
+]);
+
+const SPECIAL_KEYS = new Set([
+  "return", "escape", "space", "tab", "print", "delete", "backspace",
+  "left", "right", "up", "down", "plus", "minus",
+  "f1","f2","f3","f4","f5","f6","f7","f8","f9","f10","f11","f12",
+  "xf86audioraisevolume","xf86audiolowervolume","xf86audiomute",
+  "xf86audiomicmute","xf86audionext","xf86audioprev","xf86audioplay",
+  "xf86audiostop","xf86monbrightnessup","xf86monbrightnessdown"
+]);
+
+let allCategories = [];
+let activeFilter = null;
+
+// ── Fetch data from server ──
+async function loadBindings() {
+  try {
+    const resp = await fetch('/api/bindings');
+    allCategories = await resp.json();
+    renderStats();
+    renderAll();
+  } catch (e) {
+    document.getElementById('content').innerHTML =
+      '<div class="no-results"><span>⚠</span>Failed to load bindings from server.</div>';
+  }
+}
+
+// ── Render stats/filter chips ──
+function renderStats() {
+  const bar = document.getElementById('statsBar');
+  const totalCount = allCategories.reduce((s, c) => s + c.bindings.length, 0);
+
+  let html = `<div class="stat-chip ${!activeFilter ? 'active' : ''}" data-filter="">All <span class="count">${totalCount}</span></div>`;
+  for (const cat of allCategories) {
+    const meta = CATEGORY_META[cat.name] || CATEGORY_META["Other"];
+    const isActive = activeFilter === cat.name;
+    html += `<div class="stat-chip ${isActive ? 'active' : ''}" data-filter="${cat.name}">${cat.name} <span class="count">${cat.bindings.length}</span></div>`;
+  }
+  bar.innerHTML = html;
+
+  bar.querySelectorAll('.stat-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      const f = chip.dataset.filter;
+      activeFilter = f || null;
+      renderStats();
+      renderAll();
+    });
+  });
+}
+
+// ── Render all categories ──
+function renderAll() {
+  const query = document.getElementById('search').value.toLowerCase().trim();
+  const content = document.getElementById('content');
+  const noResults = document.getElementById('noResults');
+  let html = '';
+  let anyVisible = false;
+
+  // Keep noResults in DOM
+  for (const cat of allCategories) {
+    if (activeFilter && cat.name !== activeFilter) continue;
+
+    const meta = CATEGORY_META[cat.name] || CATEGORY_META["Other"];
+    const filtered = cat.bindings.filter(b => {
+      if (!query) return true;
+      const hay = (b.keys_display + ' ' + b.action_display + ' ' + b.comment + ' ' + b.keys_raw + ' ' + b.action_raw).toLowerCase();
+      return hay.includes(query);
+    });
+
+    if (filtered.length === 0) continue;
+    anyVisible = true;
+
+    html += `<div class="category ${meta.css}">`;
+    html += `<div class="category-header">
+      <div class="category-icon">${meta.icon}</div>
+      <div class="category-name">${cat.name}</div>
+      <div class="category-count">${filtered.length}</div>
+    </div>`;
+
+    for (const b of filtered) {
+      html += renderBinding(b);
+    }
+    html += `</div>`;
+  }
+
+  // Rebuild content but keep noResults
+  content.innerHTML = html + '<div class="no-results hidden" id="noResults"><span>¯\\_(ツ)_/¯</span>No bindings match your search.</div>';
+
+  if (!anyVisible) {
+    document.getElementById('noResults').classList.remove('hidden');
+  }
+}
+
+// ── Render one binding row ──
+function renderBinding(b) {
+  const keysHtml = renderKeys(b.keys_display);
+  const actionHtml = renderAction(b);
+
+  return `<div class="binding-row" data-line="${b.line_num}" id="row-${b.line_num}">
+    <div class="keys">${keysHtml}</div>
+    <div class="action-text">${actionHtml}</div>
+    <button class="edit-btn" onclick="startEdit(${b.line_num})">edit</button>
+  </div>`;
+}
+
+// ── Render key combination ──
+function renderKeys(display) {
+  const parts = display.split('+');
+  return parts.map((p, i) => {
+    const clean = p.trim();
+    const lower = clean.toLowerCase();
+    let cls = 'key';
+    if (MODIFIER_KEYS.has(lower)) cls += ' mod';
+    else if (SPECIAL_KEYS.has(lower)) cls += ' special';
+    const sep = i < parts.length - 1 ? '<span class="key-sep">+</span>' : '';
+    return `<span class="${cls}">${clean}</span>${sep}`;
+  }).join('');
+}
+
+// ── Render action with comment ──
+function renderAction(b) {
+  let text = '';
+  if (b.comment) {
+    text += `<span class="comment-tag">${escHtml(b.comment)}</span> — `;
+  }
+  text += `<span class="cmd">${escHtml(b.action_display)}</span>`;
+  return text;
+}
+
+// ── Edit mode ──
+function startEdit(lineNum) {
+  // Find the binding
+  let binding = null;
+  for (const cat of allCategories) {
+    binding = cat.bindings.find(b => b.line_num === lineNum);
+    if (binding) break;
+  }
+  if (!binding) return;
+
+  const row = document.getElementById(`row-${lineNum}`);
+  row.classList.add('editing');
+  row.innerHTML = `
+    <div style="grid-column:1/-1;">
+      <div class="keys">${renderKeys(binding.keys_display)}</div>
+      <div class="edit-form">
+        <div>
+          <label>Keys (raw i3 syntax)</label>
+          <input type="text" id="edit-keys-${lineNum}" value="${escAttr(binding.keys_raw)}">
+        </div>
+        <div>
+          <label>Action</label>
+          <input type="text" id="edit-action-${lineNum}" value="${escAttr(binding.action_raw)}">
+        </div>
+        <div class="edit-actions">
+          <button class="btn btn-cancel" onclick="cancelEdit()">Cancel</button>
+          <button class="btn btn-save" onclick="saveEdit(${lineNum})">Save & Reload</button>
+        </div>
+      </div>
+    </div>`;
+
+  document.getElementById(`edit-keys-${lineNum}`).focus();
+}
+
+function cancelEdit() {
+  renderAll();
+}
+
+async function saveEdit(lineNum) {
+  const keysInput = document.getElementById(`edit-keys-${lineNum}`);
+  const actionInput = document.getElementById(`edit-action-${lineNum}`);
+
+  if (!keysInput.value.trim() || !actionInput.value.trim()) {
+    showToast('Both fields are required.', true);
+    return;
+  }
+
+  try {
+    const resp = await fetch('/api/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        line_num: lineNum,
+        keys_raw: keysInput.value.trim(),
+        action_raw: actionInput.value.trim(),
+      }),
+    });
+    const result = await resp.json();
+    if (result.ok) {
+      showToast('Saved! i3 config reloaded.');
+      await loadBindings();
+    } else {
+      showToast('Error: ' + result.message, true);
+    }
+  } catch (e) {
+    showToast('Network error: ' + e.message, true);
+  }
+}
+
+// ── Toast ──
+function showToast(msg, isError = false) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show' + (isError ? ' error' : '');
+  setTimeout(() => { t.className = 'toast'; }, 3000);
+}
+
+// ── Utils ──
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function escAttr(s) {
+  return s.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── Keyboard shortcuts ──
+document.addEventListener('keydown', (e) => {
+  if (e.key === '/' && document.activeElement.tagName !== 'INPUT') {
+    e.preventDefault();
+    document.getElementById('search').focus();
+  }
+  if (e.key === 'Escape') {
+    document.getElementById('search').value = '';
+    document.getElementById('search').blur();
+    activeFilter = null;
+    renderStats();
+    renderAll();
+  }
+});
+
+document.getElementById('search').addEventListener('input', () => renderAll());
+
+// ── Boot ──
+loadBindings();
+</script>
+</body>
+</html>'''
+
+
+# ── HTTP Handler ──────────────────────────────────────────────────
+
+class CheatsheetHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/' or self.path == '/index.html':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(get_html().encode('utf-8'))
+        elif self.path == '/api/bindings':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            data = get_bindings_json()
+            self.wfile.write(json.dumps(data).encode('utf-8'))
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        if self.path == '/api/save':
+            length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(length)
+            try:
+                data = json.loads(body)
+                ok, msg = save_binding(
+                    data['line_num'],
+                    data['keys_raw'],
+                    data['action_raw'],
+                )
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": ok, "message": msg}).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": False, "message": str(e)}).encode('utf-8'))
+        else:
+            self.send_error(404)
+
+    def log_message(self, fmt, *args):
+        pass  # suppress console spam
+
+
+# ── Main ──────────────────────────────────────────────────────────
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description='i3 keybinding cheatsheet server')
+    parser.add_argument('--expose', action='store_true',
+                        help='Listen on all interfaces (0.0.0.0) for Tailscale/LAN access. '
+                             'Default is localhost only (127.0.0.1).')
+    args = parser.parse_args()
+
+    bind = '0.0.0.0' if args.expose else '127.0.0.1'
+    server = http.server.HTTPServer((bind, PORT), CheatsheetHandler)
+    print(f"i3 cheatsheet server running on http://{bind}:{PORT}")
+    if args.expose:
+        print("  ⚠  Exposed on all interfaces — make sure you trust your network (e.g. Tailscale)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+        server.server_close()
