@@ -27,7 +27,7 @@ Listens on `127.0.0.1:9876` by default — localhost only, nothing exposed to yo
 ## Install
 
 ```bash
-git clone https://github.com/Malys-Botware/i3-keybindings-cheatsheet.git
+git clone https://github.com/BalthazarVSBotWare/i3-keybindings-cheatsheet.git
 cd i3-keybindings-cheatsheet
 chmod +x install.sh
 ./install.sh
